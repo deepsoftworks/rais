@@ -13,8 +13,7 @@ namespace rais {
 /// High-resolution monotonic clock returning nanoseconds.
 ///
 /// On macOS/Apple Silicon, uses mach_absolute_time() which is lower overhead
-/// and higher resolution than clock_gettime. On Linux, falls back to
-/// clock_gettime(CLOCK_MONOTONIC).
+/// and higher resolution than clock_gettime.
 inline uint64_t clock_ns() {
 #ifdef __APPLE__
     // mach_absolute_time() returns ticks in a hardware-dependent unit.
