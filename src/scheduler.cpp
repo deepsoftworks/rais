@@ -37,8 +37,21 @@ Scheduler::~Scheduler() {
     }
 }
 
+std::shared_ptr<Task> Scheduler::alloc_task() {
+    Task* raw = task_slab_.allocate();
+    if (raw) {
+        new (raw) Task();
+        return std::shared_ptr<Task>(raw, [this](Task* t) {
+            t->~Task();
+            task_slab_.free(t);
+        });
+    }
+    // Slab exhausted — fall back to heap
+    return std::make_shared<Task>();
+}
+
 TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane) {
-    auto task = std::make_shared<Task>();
+    auto task = alloc_task();
     task->fn = std::move(fn);
     task->lane = lane;
     task->enqueue_time_ns = clock_ns();
@@ -61,7 +74,7 @@ TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane) {
 TaskHandle Scheduler::submit_gpu(std::function<void(void*, void*)> gpu_fn) {
     assert(gpu_executor_ && "submit_gpu requires a MetalExecutor in SchedulerConfig");
 
-    auto task = std::make_shared<Task>();
+    auto task = alloc_task();
     task->gpu_fn = std::move(gpu_fn);
     task->lane = Lane::GPU;
     task->enqueue_time_ns = clock_ns();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rais/allocator.hpp>
 #include <rais/clock.hpp>
 #include <rais/deque.hpp>
 #include <rais/queue.hpp>
@@ -61,10 +62,14 @@ private:
     void worker_loop(size_t worker_id);
     Task* try_steal(size_t worker_id, std::mt19937& rng);
     void check_starvation_promotions(Task* task);
+    std::shared_ptr<Task> alloc_task();
+
+    static constexpr size_t kTaskSlabCapacity = 8192;
 
     MPMCQueue<Task*> global_queue_;
     std::vector<std::unique_ptr<Worker>> workers_;
     MetalExecutor* gpu_executor_ = nullptr;
+    SlabAllocator<Task, kTaskSlabCapacity> task_slab_;
 
     // Per-lane admission counters. Indexed by static_cast<int>(Lane).
     alignas(64) std::atomic<int32_t> lane_counts_[4] = {};
