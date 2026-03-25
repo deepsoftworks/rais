@@ -98,12 +98,20 @@ void Scheduler::shutdown(ShutdownPolicy policy) {
         return; // already shutting down
     }
 
-    if (policy == ShutdownPolicy::Cancel) {
-        stop_flag_.store(true, std::memory_order_release);
+    if (policy == ShutdownPolicy::Drain) {
+        // Wait for all in-flight tasks (including GPU) to complete before
+        // telling workers to stop. Workers keep running their normal loop
+        // during this wait, draining queues and dispatching GPU work.
+        for (;;) {
+            int32_t total = 0;
+            for (int i = 0; i < 4; ++i) {
+                total += lane_counts_[i].load(std::memory_order_acquire);
+            }
+            if (total == 0) break;
+            std::this_thread::yield();
+        }
     }
 
-    // For Drain: workers keep running until queues are empty, then stop.
-    // For Cancel: workers see stop_flag and exit after current task.
     stop_flag_.store(true, std::memory_order_release);
 
     for (auto& w : workers_) {
