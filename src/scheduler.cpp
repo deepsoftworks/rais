@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 namespace rais {
@@ -71,6 +72,29 @@ TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane) {
     return TaskHandle(std::move(task));
 }
 
+TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane,
+                             uint64_t deadline_ns) {
+    auto task = alloc_task();
+    task->fn = std::move(fn);
+    task->lane = lane;
+    task->deadline_ns = deadline_ns;
+    task->enqueue_time_ns = clock_ns();
+
+    lane_counts_[static_cast<int>(lane)].fetch_add(1, std::memory_order_relaxed);
+
+    Task* raw = task.get();
+    task->self_ref = task;
+
+    {
+        std::lock_guard<std::mutex> lock(deadline_mutex_);
+        deadline_heap_.push_back(raw);
+        std::push_heap(deadline_heap_.begin(), deadline_heap_.end(),
+                       DeadlineGreater{});
+    }
+
+    return TaskHandle(std::move(task));
+}
+
 TaskHandle Scheduler::submit_gpu(std::function<void(void*, void*)> gpu_fn) {
     assert(gpu_executor_ && "submit_gpu requires a MetalExecutor in SchedulerConfig");
 
@@ -125,6 +149,19 @@ int32_t Scheduler::lane_count(Lane lane) const {
     return lane_counts_[static_cast<int>(lane)].load(std::memory_order_acquire);
 }
 
+uint64_t Scheduler::deadline_misses() const {
+    return deadline_misses_.load(std::memory_order_relaxed);
+}
+
+Task* Scheduler::pop_deadline_task() {
+    std::lock_guard<std::mutex> lock(deadline_mutex_);
+    if (deadline_heap_.empty()) return nullptr;
+    std::pop_heap(deadline_heap_.begin(), deadline_heap_.end(), DeadlineGreater{});
+    Task* t = deadline_heap_.back();
+    deadline_heap_.pop_back();
+    return t;
+}
+
 void Scheduler::worker_loop(size_t worker_id) {
     Worker& self = *workers_[worker_id];
     std::mt19937 rng(static_cast<unsigned>(worker_id));
@@ -137,6 +174,11 @@ void Scheduler::worker_loop(size_t worker_id) {
         bool stopping = stop_flag_.load(std::memory_order_acquire);
 
         Task* task = self.deque.pop();
+
+        // Deadline tasks get priority over the FIFO global queue
+        if (!task) {
+            task = pop_deadline_task();
+        }
 
         if (!task) {
             // Try global queue
@@ -221,6 +263,11 @@ void Scheduler::worker_loop(size_t worker_id) {
 
         // Check for starvation promotions
         check_starvation_promotions(task);
+
+        // Track deadline misses
+        if (task->deadline_ns != 0 && clock_ns() > task->deadline_ns) {
+            deadline_misses_.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Execute
         if (task->fn) {

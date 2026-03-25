@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <rais/clock.hpp>
 #include <rais/scheduler.hpp>
 
 #include <atomic>
@@ -156,4 +157,127 @@ TEST_CASE("TaskHandle wait and done", "[scheduler]") {
     handle.wait();
     REQUIRE(handle.done());
     REQUIRE(ran.load());
+}
+
+TEST_CASE("Deadline tasks execute before FIFO tasks", "[scheduler][deadline]") {
+    // 1 worker so execution order is deterministic
+    rais::Scheduler sched({.num_workers = 1, .global_queue_capacity = 4096});
+
+    std::vector<int> order;
+    std::mutex order_mu;
+
+    auto record = [&](int id) {
+        std::lock_guard<std::mutex> lock(order_mu);
+        order.push_back(id);
+    };
+
+    // Block the worker so we can enqueue everything before execution starts
+    std::atomic<bool> gate{false};
+    auto blocker = sched.submit([&gate]() {
+        while (!gate.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }, rais::Lane::Interactive);
+
+    // Submit FIFO tasks (no deadline) — these go to the global queue
+    for (int i = 0; i < 5; ++i) {
+        sched.submit([&record, i]() { record(i); }, rais::Lane::Background);
+    }
+
+    // Submit a deadline task — should jump ahead of the 5 FIFO tasks
+    uint64_t now = rais::clock_ns();
+    auto deadline_handle = sched.submit(
+        [&record]() { record(100); },
+        rais::Lane::Interactive,
+        now + 50'000'000ULL); // 50ms from now
+
+    // Release the worker
+    gate.store(true, std::memory_order_release);
+    blocker.wait();
+    deadline_handle.wait();
+
+    // Wait for remaining tasks
+    sched.shutdown(rais::ShutdownPolicy::Drain);
+
+    std::lock_guard<std::mutex> lock(order_mu);
+    REQUIRE(order.size() == 6);
+    // The deadline task (100) should be first after the blocker releases
+    REQUIRE(order[0] == 100);
+}
+
+TEST_CASE("Deadline ordering — nearest deadline served first", "[scheduler][deadline]") {
+    rais::Scheduler sched({.num_workers = 1, .global_queue_capacity = 4096});
+
+    std::vector<int> order;
+    std::mutex order_mu;
+
+    auto record = [&](int id) {
+        std::lock_guard<std::mutex> lock(order_mu);
+        order.push_back(id);
+    };
+
+    // Block the worker
+    std::atomic<bool> gate{false};
+    auto blocker = sched.submit([&gate]() {
+        while (!gate.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }, rais::Lane::Interactive);
+
+    uint64_t now = rais::clock_ns();
+
+    // Submit 3 deadline tasks with decreasing urgency (far, medium, near)
+    auto h_far = sched.submit([&record]() { record(3); },
+        rais::Lane::Interactive, now + 300'000'000ULL);
+    auto h_mid = sched.submit([&record]() { record(2); },
+        rais::Lane::Interactive, now + 200'000'000ULL);
+    auto h_near = sched.submit([&record]() { record(1); },
+        rais::Lane::Interactive, now + 100'000'000ULL);
+
+    // Release
+    gate.store(true, std::memory_order_release);
+    blocker.wait();
+    h_far.wait();
+    h_mid.wait();
+    h_near.wait();
+
+    std::lock_guard<std::mutex> lock(order_mu);
+    REQUIRE(order.size() == 3);
+    // Nearest deadline should run first
+    REQUIRE(order[0] == 1);
+    REQUIRE(order[1] == 2);
+    REQUIRE(order[2] == 3);
+}
+
+TEST_CASE("Deadline miss counter incremented for late tasks", "[scheduler][deadline]") {
+    rais::Scheduler sched({.num_workers = 1, .global_queue_capacity = 4096});
+
+    // Submit a task whose deadline is already in the past — guaranteed miss
+    // regardless of scheduling order or worker startup timing.
+    auto h = sched.submit([]() {},
+        rais::Lane::Interactive,
+        1ULL); // 1ns since boot ≈ the dawn of time
+
+    h.wait();
+
+    REQUIRE(sched.deadline_misses() >= 1);
+}
+
+TEST_CASE("Deadline tasks complete during Drain shutdown", "[scheduler][deadline]") {
+    constexpr int N = 100;
+    std::atomic<int> counter{0};
+
+    {
+        rais::Scheduler sched({.num_workers = 2, .global_queue_capacity = 4096});
+
+        uint64_t now = rais::clock_ns();
+        for (int i = 0; i < N; ++i) {
+            sched.submit([&counter]() {
+                counter.fetch_add(1, std::memory_order_relaxed);
+            }, rais::Lane::Interactive, now + static_cast<uint64_t>(i) * 1'000'000ULL);
+        }
+        // Destructor calls shutdown(Drain)
+    }
+
+    REQUIRE(counter.load(std::memory_order_relaxed) == N);
 }

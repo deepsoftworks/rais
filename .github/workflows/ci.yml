@@ -7,35 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  # ── Linux: CPU-only tests (no Metal) ──────────────────────────────────────
-  linux:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - name: ASan + UBSan
-            cmake_flags: "-fsanitize=address,undefined"
-            build_dir: build-asan
-          - name: TSan
-            cmake_flags: "-fsanitize=thread"
-            build_dir: build-tsan
-    name: "Linux (${{ matrix.name }})"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake catch2 libcatch2-dev
-
-      - name: Configure
-        run: cmake -B ${{ matrix.build_dir }} -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="${{ matrix.cmake_flags }}"
-
-      - name: Build
-        run: cmake --build ${{ matrix.build_dir }}
-
-      - name: Test
-        run: cd ${{ matrix.build_dir }} && ctest --output-on-failure
-
-  # ── macOS: full suite including Metal ─────────────────────────────────────
   macos:
     runs-on: macos-14  # M1-based runner — has Metal GPU
     strategy:
@@ -49,6 +20,10 @@ jobs:
             build_type: Debug
             cmake_flags: "-fsanitize=address,undefined"
             build_dir: build-asan
+          - name: TSan
+            build_type: Debug
+            cmake_flags: "-fsanitize=thread"
+            build_dir: build-tsan
           - name: Release
             build_type: Release
             cmake_flags: ""
@@ -69,8 +44,8 @@ jobs:
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
 
-      - name: Test (all including Metal)
-        run: cd ${{ matrix.build_dir }} && ctest --output-on-failure
+      - name: Test
+        run: ctest --test-dir ${{ matrix.build_dir }} --output-on-failure
 
       - name: Benchmarks
         if: matrix.build_type == 'Release'
