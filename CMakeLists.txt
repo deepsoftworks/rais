@@ -15,6 +15,8 @@ add_library(rais STATIC
     src/scheduler.cpp
     src/streaming.cpp
     src/layer_streamer.cpp
+    src/memory_pressure.cpp
+    src/model_manager.cpp
     src/metal_executor.mm
     src/metal_allocator.mm
     src/profiler.mm
@@ -77,6 +79,14 @@ add_test(NAME test_io_lane COMMAND test_io_lane)
 add_executable(test_layer_streamer tests/test_layer_streamer.mm)
 target_link_libraries(test_layer_streamer PRIVATE rais Catch2::Catch2WithMain)
 add_test(NAME test_layer_streamer COMMAND test_layer_streamer)
+
+add_executable(test_memory_pressure tests/test_memory_pressure.mm)
+target_link_libraries(test_memory_pressure PRIVATE rais Catch2::Catch2WithMain)
+add_test(NAME test_memory_pressure COMMAND test_memory_pressure)
+
+add_executable(test_model_swap tests/test_model_swap.cpp)
+target_link_libraries(test_model_swap PRIVATE rais Catch2::Catch2WithMain)
+add_test(NAME test_model_swap COMMAND test_model_swap)
 
 add_executable(test_metal_executor tests/test_metal_executor.mm)
 target_link_libraries(test_metal_executor PRIVATE rais Catch2::Catch2WithMain)

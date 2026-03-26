@@ -28,7 +28,7 @@ public:
     /// Acquire a buffer of at least `bytes` size. Rounds up to the next
     /// size class and returns a pooled buffer if available, or allocates
     /// a new one. Returns id<MTLBuffer> as void*. Returns nullptr on
-    /// allocation failure.
+    /// allocation failure or if the allocation would exceed the memory budget.
     void* acquire(size_t bytes);
 
     /// Return a buffer to the pool. Does not deallocate or zero memory.
@@ -41,6 +41,16 @@ public:
 
     /// Total number of buffers currently in use (acquired but not released).
     size_t live_buffers() const;
+
+    /// Sum of all live (acquired, not yet released) buffers' sizes in bytes.
+    /// Tracked atomically — safe to call from any thread.
+    size_t total_allocated_bytes() const;
+
+    /// Set the maximum total bytes that can be allocated via acquire().
+    /// 0 = no limit (default). acquire() returns nullptr if the allocation
+    /// would push total_allocated_bytes past this budget.
+    void set_memory_budget(size_t bytes);
+    size_t memory_budget() const;
 
 private:
     struct Impl;

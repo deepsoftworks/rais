@@ -2,9 +2,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <fstream>
 #include <iostream>
+#include <string>
+#include <thread>
 #include <vector>
 
 static std::string today() {

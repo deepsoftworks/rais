@@ -41,6 +41,13 @@ struct MetalBufferPool::Impl {
     std::array<Bucket, kNumSizeClasses> buckets;
 
     std::atomic<size_t> live_count{0};
+
+    // Total bytes currently allocated (live buffers only). Updated
+    // atomically in acquire/release using the buffer's rounded size.
+    std::atomic<size_t> allocated_bytes{0};
+
+    // Memory budget in bytes. 0 = unlimited.
+    std::atomic<size_t> budget{0};
 };
 
 MetalBufferPool::MetalBufferPool(void* device)
@@ -57,17 +64,40 @@ MetalBufferPool::~MetalBufferPool() {
 
 void* MetalBufferPool::acquire(size_t bytes) {
     size_t idx = size_class_index(bytes);
+    size_t rounded_size = (idx < kNumSizeClasses) ? kSizeClasses[idx] : bytes;
+
+    // Budget check: reject if this allocation would exceed the limit.
+    // Uses a CAS loop so concurrent acquires don't overshoot.
+    size_t budget_val = impl_->budget.load(std::memory_order_relaxed);
+    if (budget_val > 0) {
+        size_t current = impl_->allocated_bytes.load(std::memory_order_relaxed);
+        while (true) {
+            if (current + rounded_size > budget_val) return nullptr;
+            // relaxed: budget enforcement is best-effort; no ordering
+            // dependency on other data. acquire/release on allocated_bytes
+            // isn't needed because we don't publish shared state through it.
+            if (impl_->allocated_bytes.compare_exchange_weak(
+                    current, current + rounded_size,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    } else {
+        impl_->allocated_bytes.fetch_add(rounded_size, std::memory_order_relaxed);
+    }
+
     if (idx >= kNumSizeClasses) {
         // Request exceeds largest size class — allocate directly
         id<MTLBuffer> buf = [impl_->device
             newBufferWithLength:bytes
             options:MTLResourceStorageModeShared];
-        if (!buf) return nullptr;
+        if (!buf) {
+            impl_->allocated_bytes.fetch_sub(rounded_size, std::memory_order_relaxed);
+            return nullptr;
+        }
         impl_->live_count.fetch_add(1, std::memory_order_relaxed);
         return (__bridge void*)buf;
     }
-
-    size_t alloc_size = kSizeClasses[idx];
 
     // Try to pop from the free list
     {
@@ -83,9 +113,12 @@ void* MetalBufferPool::acquire(size_t bytes) {
 
     // Allocate a new buffer
     id<MTLBuffer> buf = [impl_->device
-        newBufferWithLength:alloc_size
+        newBufferWithLength:rounded_size
         options:MTLResourceStorageModeShared];
-    if (!buf) return nullptr;
+    if (!buf) {
+        impl_->allocated_bytes.fetch_sub(rounded_size, std::memory_order_relaxed);
+        return nullptr;
+    }
 
     // Runtime assert: on Apple Silicon, Managed mode is pointless.
     // We always use Shared. Verify the buffer got Shared mode.
@@ -104,6 +137,7 @@ void MetalBufferPool::release(void* buffer) {
     size_t idx = size_class_index(len);
 
     impl_->live_count.fetch_sub(1, std::memory_order_relaxed);
+    impl_->allocated_bytes.fetch_sub(len, std::memory_order_relaxed);
 
     if (idx >= kNumSizeClasses) {
         // Oversized buffer — not pooled, caller is done with it
@@ -128,6 +162,18 @@ size_t MetalBufferPool::pool_size() const {
 
 size_t MetalBufferPool::live_buffers() const {
     return impl_->live_count.load(std::memory_order_acquire);
+}
+
+size_t MetalBufferPool::total_allocated_bytes() const {
+    return impl_->allocated_bytes.load(std::memory_order_relaxed);
+}
+
+void MetalBufferPool::set_memory_budget(size_t bytes) {
+    impl_->budget.store(bytes, std::memory_order_relaxed);
+}
+
+size_t MetalBufferPool::memory_budget() const {
+    return impl_->budget.load(std::memory_order_relaxed);
 }
 
 } // namespace rais
