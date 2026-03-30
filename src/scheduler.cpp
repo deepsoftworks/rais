@@ -151,7 +151,10 @@ TaskHandle Scheduler::submit_after(std::function<void()> fn, Lane lane,
         // Race: the predecessor may have already completed. We check after
         // registering. If it completed before we registered, its completion
         // path won't see us, so we account for it with already_done.
-        pred->dependents.push_back(raw);
+        {
+            std::lock_guard<std::mutex> lock(pred->dependents_mu);
+            pred->dependents.push_back(raw);
+        }
 
         // fence: acquire pairs with predecessor's completed.store(release)
         if (pred->completed.load(std::memory_order_acquire)) {
@@ -250,7 +253,13 @@ Task* Scheduler::pop_deadline_task() {
 
 void Scheduler::activate_dependents(Task* task,
                                     WorkStealingDeque<Task*>& local_deque) {
-    for (Task* dep : task->dependents) {
+    // Snapshot dependents under lock — submit_after may concurrently push_back.
+    std::vector<Task*> deps;
+    {
+        std::lock_guard<std::mutex> lock(task->dependents_mu);
+        deps = task->dependents;
+    }
+    for (Task* dep : deps) {
         if (task->cancelled.load(std::memory_order_acquire)) {
             // Cascading cancellation: mark dependent as cancelled+completed
             // so its own dependents and waiters unblock.
@@ -349,7 +358,12 @@ void Scheduler::worker_loop(size_t worker_id) {
                         lane_counts_[static_cast<int>(Lane::GPU)].fetch_sub(1,
                             std::memory_order_relaxed);
                         ref->completed.store(true, std::memory_order_release);
-                        for (Task* dep : ref->dependents) {
+                        std::vector<Task*> deps;
+                        {
+                            std::lock_guard<std::mutex> lock(ref->dependents_mu);
+                            deps = ref->dependents;
+                        }
+                        for (Task* dep : deps) {
                             int32_t prev = dep->pending_deps.fetch_sub(1,
                                 std::memory_order_acq_rel);
                             if (prev == 1) {

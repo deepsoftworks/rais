@@ -10,6 +10,7 @@ jobs:
   macos:
     runs-on: macos-14  # M1-based runner — has Metal GPU
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Debug

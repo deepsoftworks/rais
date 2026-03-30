@@ -108,6 +108,90 @@ All measurements on Apple Silicon (M-series), release build.
 | Slab allocator alloc (single thread, p50) | 83 ns |
 | Scheduler Interactive dispatch (p50) | 228 µs |
 
+## Quick start
+
+Clone, build, and run the priority scheduling example in under a minute:
+
+```bash
+git clone https://github.com/deepsoftworks/rais.git && cd rais
+brew install catch2
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target priority_example
+./build/priority_example
+```
+
+The example simulates 6 concurrent requests (3 batch + 3 interactive) hitting
+a single-threaded decoder. RAIS jumps the interactive requests to the front of
+the queue so they start before the batch jobs — no code changes to your model
+needed.
+
+## Integrating with mlx-lm
+
+RAIS sits between your inference loop and the hardware. It does not replace
+`mlx-lm` or any other inference engine — it decides *which* request runs
+next and when to prefetch the next layer from disk.
+
+**Priority scheduling** — wrap your `mlx_lm.generate()` calls in RAIS tasks:
+
+```cpp
+#include <rais/scheduler.hpp>
+
+rais::Scheduler sched({.num_workers = 4});
+
+// User-facing request — low latency
+auto h = sched.submit([&]() {
+    // call your generate / decode function here
+    run_inference(prompt, model, tokenizer);
+}, rais::Lane::Interactive);
+
+// Background batch job — yields to interactive
+sched.submit([&]() {
+    run_batch_eval(dataset, model, tokenizer);
+}, rais::Lane::Bulk);
+
+h.wait(); // interactive request finishes first
+```
+
+**Layer streaming** — overlap SSD reads with GPU compute:
+
+```cpp
+#include <rais/layer_streamer.hpp>
+#include <rais/metal_allocator.hpp>
+
+rais::MetalBufferPool pool(device);
+rais::LayerStreamer streamer(sched, pool, {
+    .layer_size_bytes = layer_bytes,
+    .num_buffer_slots = 3,       // triple-buffer
+    .model_dir = "models/llama",
+    .num_layers = 32,
+});
+
+streamer.start_prefetch(0);      // fill the pipeline
+for (size_t i = 0; i < 32; ++i) {
+    auto h = streamer.request_layer(i, [&](void* buf) {
+        // buf is a Metal shared buffer with layer weights
+        run_layer_forward(i, buf);
+    });
+    h.wait();
+    streamer.release_layer(i);   // recycle the buffer slot
+}
+```
+
+**Model hot-swap** — switch models without downtime:
+
+```cpp
+#include <rais/model_manager.hpp>
+
+rais::ModelManager mgr(sched);
+mgr.swap("models/llama-v2",
+    [](const std::string& path) { /* load_fn */ },
+    [](const std::string& path) { /* unload_fn */ },
+    [](bool ok) { printf("swap %s\n", ok ? "done" : "failed"); });
+
+// Old model keeps serving interactive requests throughout.
+// When the swap completes, old model is unloaded atomically.
+```
+
 ## Building
 
 Requires macOS on Apple Silicon (M1+), CMake 3.20+, Xcode command line tools,
@@ -172,6 +256,8 @@ src/
   profiler.mm          Chrome trace-event profiler
 shaders/
   rais_kernels.metal   rms_norm, silu, attention_scores, elementwise_add
+examples/
+  priority_scheduling.cpp   Self-contained priority scheduling demo (no deps)
 experiments/
   bench_inference_llm.cpp     Layer-streaming IO benchmark on real weights
   bench_mlx_concurrent.py     Priority scheduling benchmark with MLX

@@ -216,13 +216,23 @@ TEST_CASE("Deadline ordering — nearest deadline served first", "[scheduler][de
         order.push_back(id);
     };
 
-    // Block the worker
+    // Block the worker and wait for it to actually start running before
+    // submitting deadline tasks. Without this, the worker might pop a
+    // deadline task from the heap before ever picking up the blocker from
+    // the global queue (the worker checks the deadline heap first).
     std::atomic<bool> gate{false};
-    auto blocker = sched.submit([&gate]() {
+    std::atomic<bool> blocker_running{false};
+    auto blocker = sched.submit([&gate, &blocker_running]() {
+        blocker_running.store(true, std::memory_order_release);
         while (!gate.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
     }, rais::Lane::Interactive);
+
+    // Wait for the blocker to be running — the single worker is now occupied
+    while (!blocker_running.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 
     uint64_t now = rais::clock_ns();
 

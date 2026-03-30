@@ -119,8 +119,6 @@ static void bench_slab_concurrent(std::vector<BenchResult>& results) {
     rais::SlabAllocator<uint64_t, N> slab;
     std::atomic<bool> start{false};
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-
     std::vector<std::thread> threads;
     for (size_t t = 0; t < NUM_THREADS; ++t) {
         threads.emplace_back([&]() {
