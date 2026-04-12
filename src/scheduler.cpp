@@ -347,8 +347,8 @@ void Scheduler::activate_dependents(Task* task,
                 // without running fn, then propagate to its own dependents.
                 lane_counts_[static_cast<int>(dep->lane)].fetch_sub(1,
                     std::memory_order_relaxed);
-                activate_dependents(dep, local_deque);
                 dep->completed.store(true, std::memory_order_release);
+                activate_dependents(dep, local_deque);
                 release_task_lifetime_ref(dep);
             } else {
                 // Push to the completing worker's local deque for cache locality:
@@ -413,8 +413,8 @@ void Scheduler::worker_loop(size_t worker_id) {
         if (task->cancelled.load(std::memory_order_acquire)) {
             lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
                 std::memory_order_relaxed);
-            activate_dependents(task, self.deque);
             task->completed.store(true, std::memory_order_release);
+            activate_dependents(task, self.deque);
             release_task_lifetime_ref(task); // break ref cycle safely
             continue;
         }
@@ -451,8 +451,8 @@ void Scheduler::worker_loop(size_t worker_id) {
                 // No GPU executor — mark completed immediately (nothing to run)
                 lane_counts_[static_cast<int>(Lane::GPU)].fetch_sub(1,
                     std::memory_order_relaxed);
-                activate_dependents(task, self.deque);
                 task->completed.store(true, std::memory_order_release);
+                activate_dependents(task, self.deque);
                 release_task_lifetime_ref(task);
             }
             continue;
@@ -485,8 +485,8 @@ void Scheduler::worker_loop(size_t worker_id) {
         }
         lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
             std::memory_order_relaxed);
-        activate_dependents(task, self.deque);
         task->completed.store(true, std::memory_order_release);
+        activate_dependents(task, self.deque);
         release_task_lifetime_ref(task); // break ref cycle safely
     }
 }
@@ -523,8 +523,8 @@ void Scheduler::io_worker_loop() {
         if (task->cancelled.load(std::memory_order_acquire)) {
             lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
                 std::memory_order_relaxed);
-            activate_dependents(task, local_deque);
             task->completed.store(true, std::memory_order_release);
+            activate_dependents(task, local_deque);
             release_task_lifetime_ref(task);
             // Drain any dependents that were pushed to our local deque
             // back into the appropriate global queue.
@@ -540,8 +540,8 @@ void Scheduler::io_worker_loop() {
         }
         lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
             std::memory_order_relaxed);
-        activate_dependents(task, local_deque);
         task->completed.store(true, std::memory_order_release);
+        activate_dependents(task, local_deque);
         release_task_lifetime_ref(task);
 
         // Dependents activated by IO completion likely belong to other lanes

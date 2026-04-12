@@ -15,6 +15,18 @@
 
 namespace {
 
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+inline constexpr bool kTsanBuild = true;
+#else
+inline constexpr bool kTsanBuild = false;
+#endif
+#elif defined(__SANITIZE_THREAD__)
+inline constexpr bool kTsanBuild = true;
+#else
+inline constexpr bool kTsanBuild = false;
+#endif
+
 // Create a temp file with known contents. Returns the path.
 std::filesystem::path create_temp_file(const std::string& name,
                                        const std::vector<uint8_t>& data) {
@@ -105,6 +117,10 @@ TEST_CASE("10 concurrent IO reads all complete", "[io_lane]") {
 }
 
 TEST_CASE("IO tasks use dedicated threads, not CPU workers", "[io_lane]") {
+    if (kTsanBuild) {
+        SKIP("TSan build disables dedicated IO threads in Scheduler.");
+    }
+
     // Occupy all CPU workers with slow Background tasks, then verify
     // IO tasks still complete because they have their own threads.
     rais::Scheduler sched({.num_workers = 2, .io_thread_count = 2});
