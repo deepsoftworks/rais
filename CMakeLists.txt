@@ -8,6 +8,8 @@ set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_EXTENSIONS OFF)
 
+option(RAIS_BUILD_PYTHON "Build Python bindings (pybind11)" OFF)
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # Library target
@@ -126,6 +128,22 @@ add_dependencies(bench_metal metal_shaders)
 add_executable(priority_example examples/priority_scheduling.cpp)
 target_link_libraries(priority_example PRIVATE rais)
 
+add_executable(minimal_submit_example examples/minimal_submit.cpp)
+target_link_libraries(minimal_submit_example PRIVATE rais)
+
+add_executable(llama_cpp_integration_example examples/llama_cpp_integration.cpp)
+target_link_libraries(llama_cpp_integration_example PRIVATE rais)
+
+add_executable(rais_server examples/rais_server.cpp)
+target_link_libraries(rais_server PRIVATE rais)
+
 # Experiments
 add_executable(bench_inference_llm experiments/bench_inference_llm.cpp)
 target_link_libraries(bench_inference_llm PRIVATE rais)
+
+if(RAIS_BUILD_PYTHON)
+    find_package(pybind11 CONFIG REQUIRED)
+    pybind11_add_module(pyrais MODULE python/rais_pybind.cpp)
+    target_link_libraries(pyrais PRIVATE rais)
+    set_target_properties(pyrais PROPERTIES OUTPUT_NAME rais)
+endif()

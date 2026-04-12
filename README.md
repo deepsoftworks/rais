@@ -1,14 +1,67 @@
 # RAIS
 
-**RAIS** (Runtime for AI Scheduling; رئيس) is a C++20 scheduling runtime for
-low-latency AI inference on Apple Silicon. It sits between your inference engine
-and the hardware, deciding what runs, when, and on which resource — so that
-user-facing requests stay fast even when the system is under load.
+[![CI](https://github.com/deepsoftworks/rais/actions/workflows/ci.yml/badge.svg)](https://github.com/deepsoftworks/rais/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+**Run multiple LLM requests on Apple Silicon without latency spikes.**
+
+RAIS is a C++ runtime that schedules AI inference workloads across CPU, GPU
+(Metal), and IO to keep real-time requests fast even under heavy load.
+
+## Why use RAIS
+
+- 3.4x faster time-to-first-token under load
+- Zero-downtime model switching
+- 1.15-1.20x higher throughput via IO/GPU overlap
+
+## Who is this for
+
+- Running local LLMs (MLX, llama.cpp, etc.)
+- Building inference servers on Apple Silicon
+- Anyone hitting latency spikes with concurrent requests
+
+## Scheduler layout
+
+```mermaid
+flowchart TD
+    Requests[IncomingRequests] --> Scheduler[RAISScheduler]
+    Scheduler --> Interactive[InteractiveLaneUsers]
+    Scheduler --> Gpu[GPULaneMetal]
+    Scheduler --> Io[IOLaneSSDStreaming]
+    Scheduler --> Bulk[BulkLaneBatchJobs]
+```
+
+## Demo
+
+```text
+6 concurrent requests (3 interactive, 3 background)
+
+Naive FIFO:     Interactive TTFT ~4.8s
+RAIS Priority:  Interactive TTFT ~1.4s
+```
+
+These numbers come from the `Llama-3.2-1B-Instruct-4bit` concurrent benchmark
+already included in this repo.
+
+## Comparison
+
+| Feature | Thread Pool | RAIS |
+|---|---|---|
+| Priority scheduling | ❌ | ✅ |
+| GPU-aware | ❌ | ✅ |
+| IO/GPU overlap | ❌ | ✅ |
+| Model hot-swap | ❌ | ✅ |
+
+## Works with
+
+- MLX / mlx-lm
+- llama.cpp (integration example included)
+- PyTorch (via bindings)
 
 ## The problem
 
 Running LLMs in production on Apple Silicon surfaces three bottlenecks that
-inference engines don't solve on their own:
+inference engines do not solve on their own:
 
 1. **Contention between requests.** When multiple prompts arrive at once, a
    naive FIFO queue makes real-time users wait behind long batch jobs.
@@ -18,7 +71,7 @@ inference engines don't solve on their own:
 2. **SSD-to-GPU stalls.** Loading model weights layer-by-layer from disk is
    sequential by default — the GPU sits idle while each layer reads in. On
    real LLM weights (SmolLM2-135M, TinyLlama-1.1B), RAIS's IO pipeline
-   delivers **1.15–1.20x higher throughput** by overlapping disk reads with
+   delivers **1.15-1.20x higher throughput** by overlapping disk reads with
    compute.
 
 3. **Model switching downtime.** Swapping between models (e.g. changing
@@ -110,13 +163,12 @@ All measurements on Apple Silicon (M-series), release build.
 
 ## Quick start
 
-Clone, build, and run the priority scheduling example in under a minute:
+Clone, install dependencies, and build:
 
 ```bash
 git clone https://github.com/deepsoftworks/rais.git && cd rais
-brew install catch2
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target priority_example
+./install.sh
+cmake --build build --target priority_example minimal_submit_example
 ./build/priority_example
 ```
 
@@ -124,6 +176,52 @@ The example simulates 6 concurrent requests (3 batch + 3 interactive) hitting
 a single-threaded decoder. RAIS jumps the interactive requests to the front of
 the queue so they start before the batch jobs — no code changes to your model
 needed.
+
+### Minimal drop-in usage
+
+```cpp
+rais::Scheduler sched;
+
+sched.submit([&] {
+    generate(prompt);
+}, rais::Lane::Interactive);
+```
+
+Runnable source: `examples/minimal_submit.cpp`
+
+```bash
+cmake --build build --target minimal_submit_example
+./build/minimal_submit_example
+```
+
+### Python bindings (preview)
+
+Build optional bindings with pybind11:
+
+```bash
+WITH_PYTHON=1 ./install.sh
+PYTHONPATH=build python3 -c "import rais; print(rais.Scheduler)"
+```
+
+### llama.cpp integration example
+
+Use RAIS lane scheduling around llama.cpp decode loops:
+
+```bash
+cmake --build build --target llama_cpp_integration_example
+./build/llama_cpp_integration_example
+```
+
+Example source: `examples/llama_cpp_integration.cpp`
+
+### Server mode example
+
+Run a minimal scheduler-backed server loop:
+
+```bash
+cmake --build build --target rais_server
+./build/rais_server --model llama
+```
 
 ## Integrating with mlx-lm
 
@@ -204,6 +302,14 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+Optional Python bindings:
+
+```bash
+brew install pybind11
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DRAIS_BUILD_PYTHON=ON -Dpybind11_DIR="$(brew --prefix pybind11)/share/cmake/pybind11"
+cmake --build build --target pyrais
+```
+
 ## Running benchmarks
 
 ```bash
@@ -226,6 +332,12 @@ python3 experiments/fetch_model.py HuggingFaceTB/SmolLM2-135M
 ```bash
 pip install mlx mlx-lm
 python3 experiments/bench_mlx_concurrent.py --model llama1b --clients 6
+```
+
+**Cross-tool comparison artifact** (naive thread pool + RAIS + optional llama.cpp baseline):
+```bash
+python3 experiments/bench_compare_tools.py --rais-tsv experiments/mlx_concurrent_results.tsv
+python3 experiments/bench_compare_tools.py --rais-tsv experiments/mlx_concurrent_results.tsv --llama-tsv experiments/llama_cpp_baseline.tsv.example
 ```
 
 ## Project structure
@@ -257,11 +369,16 @@ src/
 shaders/
   rais_kernels.metal   rms_norm, silu, attention_scores, elementwise_add
 examples/
+  minimal_submit.cpp         5-line scheduler usage example
   priority_scheduling.cpp   Self-contained priority scheduling demo (no deps)
+  llama_cpp_integration.cpp  llama.cpp-oriented integration skeleton
+  rais_server.cpp            Minimal scheduler-backed server mode demo
 experiments/
   bench_inference_llm.cpp     Layer-streaming IO benchmark on real weights
   bench_mlx_concurrent.py     Priority scheduling benchmark with MLX
+  bench_compare_tools.py      Generate markdown comparison table across tools
   fetch_model.py              Download + split HuggingFace models
+  llama_cpp_baseline.tsv.example  Optional input format for llama.cpp baseline
 tests/                        Catch2 test suites
 benchmarks/                   Per-subsystem microbenchmarks
 ```
