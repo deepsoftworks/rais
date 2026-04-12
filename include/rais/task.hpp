@@ -37,6 +37,9 @@ struct Task {
     // still be running when submit_after() registers a new dependent.
     std::mutex                   dependents_mu;
     std::vector<Task*>           dependents;
+    // Protected by dependents_mu. Cleared once completion snapshots dependents;
+    // submit_after uses this to avoid late registration races.
+    bool                         accepting_dependents = true;
 
     // Number of predecessors that haven't completed yet. The task is not
     // runnable until this reaches 0.

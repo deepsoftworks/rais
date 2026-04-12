@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -94,7 +95,10 @@ private:
     Task* pop_deadline_task();
     void activate_dependents(Task* task, WorkStealingDeque<Task*>& local_deque);
     void enqueue_task(Task* raw);
+    void push_global_task(Task* raw);
+    bool pop_global_task(Task*& raw);
     void io_worker_loop();
+    void release_task_lifetime_ref(Task* task);
 
     static constexpr size_t kTaskSlabCapacity = 8192;
 
@@ -121,6 +125,14 @@ private:
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> shutdown_called_{false};
     alignas(64) std::atomic<uint64_t> deadline_misses_{0};
+
+    std::mutex tsan_global_mu_;
+    std::deque<Task*> tsan_global_queue_;
+
+    // TSan mode defers task destruction until worker threads have joined,
+    // avoiding teardown races while sanitizer instrumentation is active.
+    std::mutex tsan_retired_mu_;
+    std::vector<std::shared_ptr<Task>> tsan_retired_tasks_;
 };
 
 } // namespace rais

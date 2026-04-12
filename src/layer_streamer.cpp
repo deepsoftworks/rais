@@ -132,6 +132,12 @@ void LayerStreamer::release_layer(size_t layer_idx) {
 
     for (auto& slot : slots_) {
         if (slot.occupied && slot.layer_idx == layer_idx) {
+            // Ensure the prior read task is fully complete before this slot is
+            // recycled. This prevents the scheduler from still touching the
+            // predecessor task/dependents while the handle is dropped.
+            if (!slot.read_handle.done()) {
+                slot.read_handle.wait();
+            }
             slot.occupied = false;
             slot.layer_idx = SIZE_MAX;
             slot.read_handle = TaskHandle{};

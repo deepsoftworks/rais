@@ -1,14 +1,22 @@
-# RAIS
+<h1 align="center">Rais</h1>
 
-[![CI](https://github.com/deepsoftworks/rais/actions/workflows/ci.yml/badge.svg)](https://github.com/deepsoftworks/rais/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+<p align="center"><strong>Runtime for AI Scheduling</strong></p>
 
-**Run multiple LLM requests on Apple Silicon without latency spikes.**
+<p align="center">
+  <a href="https://github.com/deepsoftworks/rais/actions/workflows/ci.yml"><img src="https://github.com/deepsoftworks/rais/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
+  <a href="https://github.com/deepsoftworks/rais/releases"><img src="https://img.shields.io/github/v/release/deepsoftworks/rais?label=latest%20version" alt="Latest Version"></a>
+  <img alt="macOS" src="https://img.shields.io/badge/-macOS-black?style=flat-square&logo=apple&logoColor=white" />
+</p>
 
-RAIS is a C++ runtime that schedules AI inference workloads across CPU, GPU
+<p align="center"><strong>Run multiple LLM requests on Apple Silicon without latency spikes.</strong></p>
+
+---
+
+Rais is a C++ runtime that schedules AI inference workloads across CPU, GPU
 (Metal), and IO to keep real-time requests fast even under heavy load.
 
-## Why use RAIS
+## Why use Rais 
 
 - 3.4x faster time-to-first-token under load
 - Zero-downtime model switching
@@ -37,7 +45,7 @@ flowchart TD
 6 concurrent requests (3 interactive, 3 background)
 
 Naive FIFO:     Interactive TTFT ~4.8s
-RAIS Priority:  Interactive TTFT ~1.4s
+Rais Priority:  Interactive TTFT ~1.4s
 ```
 
 These numbers come from the `Llama-3.2-1B-Instruct-4bit` concurrent benchmark
@@ -45,7 +53,7 @@ already included in this repo.
 
 ## Comparison
 
-| Feature | Thread Pool | RAIS |
+| Feature | Thread Pool | Rais |
 |---|---|---|
 | Priority scheduling | ❌ | ✅ |
 | GPU-aware | ❌ | ✅ |
@@ -70,18 +78,18 @@ inference engines do not solve on their own:
 
 2. **SSD-to-GPU stalls.** Loading model weights layer-by-layer from disk is
    sequential by default — the GPU sits idle while each layer reads in. On
-   real LLM weights (SmolLM2-135M, TinyLlama-1.1B), RAIS's IO pipeline
+   real LLM weights (SmolLM2-135M, TinyLlama-1.1B), Rais's IO pipeline
    delivers **1.15-1.20x higher throughput** by overlapping disk reads with
    compute.
 
 3. **Model switching downtime.** Swapping between models (e.g. changing
    assistant persona or loading a fine-tune) normally requires draining all
-   in-flight requests before unloading. With RAIS, the new model loads in the
+   in-flight requests before unloading. With Rais, the new model loads in the
    background on a dedicated task while the old model keeps serving.
 
-## What RAIS does
+## What Rais does
 
-RAIS provides a task scheduler with five priority lanes that map directly to
+Rais provides a task scheduler with five priority lanes that map directly to
 the different classes of work in an inference server:
 
 | Lane | Target | Use |
@@ -92,7 +100,7 @@ the different classes of work in an inference server:
 | `GPU` | Metal async | Compute kernel dispatch |
 | `IO` | Dedicated threads | SSD weight reads, never blocks CPU |
 
-When a real-time request arrives while batch jobs are queued, RAIS jumps it
+When a real-time request arrives while batch jobs are queued, Rais jumps it
 to the front. In the 6-client benchmark above, this reduces interactive TTFT
 from **4,829ms to 1,438ms — a 3.4x improvement** with no change to total
 throughput.
@@ -140,14 +148,14 @@ All measurements on Apple Silicon (M-series), release build.
 **Concurrent request scheduling** (Llama-3.2-1B-Instruct-4bit, 6 clients,
 3 interactive / 3 background, background batch pre-queued):
 
-| Metric | Naive FIFO | RAIS Priority | Speedup |
+| Metric | Naive FIFO | Rais Priority | Speedup |
 |---|---|---|---|
 | Interactive TTFT | 4,829 ms | 1,438 ms | **3.4x** |
 | Interactive E2E | 5,653 ms | 2,254 ms | **2.5x** |
 
 **Layer-streaming throughput** (real weight files, IO/compute overlapped):
 
-| Model | Naive | RAIS | Speedup |
+| Model | Naive | Rais | Speedup |
 |---|---|---|---|
 | SmolLM2-135M (257 MB, 31 layers) | 157 tok/s | 188 tok/s | **1.20x** |
 | TinyLlama-1.1B (2.1 GB, 23 layers) | 15.5 tok/s | 17.8 tok/s | **1.15x** |
@@ -173,7 +181,7 @@ cmake --build build --target priority_example minimal_submit_example
 ```
 
 The example simulates 6 concurrent requests (3 batch + 3 interactive) hitting
-a single-threaded decoder. RAIS jumps the interactive requests to the front of
+a single-threaded decoder. Rais jumps the interactive requests to the front of
 the queue so they start before the batch jobs — no code changes to your model
 needed.
 
@@ -205,7 +213,7 @@ PYTHONPATH=build python3 -c "import rais; print(rais.Scheduler)"
 
 ### llama.cpp integration example
 
-Use RAIS lane scheduling around llama.cpp decode loops:
+Use Rais lane scheduling around llama.cpp decode loops:
 
 ```bash
 cmake --build build --target llama_cpp_integration_example
@@ -225,11 +233,11 @@ cmake --build build --target rais_server
 
 ## Integrating with mlx-lm
 
-RAIS sits between your inference loop and the hardware. It does not replace
+Rais sits between your inference loop and the hardware. It does not replace
 `mlx-lm` or any other inference engine — it decides *which* request runs
 next and when to prefetch the next layer from disk.
 
-**Priority scheduling** — wrap your `mlx_lm.generate()` calls in RAIS tasks:
+**Priority scheduling** — wrap your `mlx_lm.generate()` calls in Rais tasks:
 
 ```cpp
 #include <rais/scheduler.hpp>
@@ -334,7 +342,7 @@ pip install mlx mlx-lm
 python3 experiments/bench_mlx_concurrent.py --model llama1b --clients 6
 ```
 
-**Cross-tool comparison artifact** (naive thread pool + RAIS + optional llama.cpp baseline):
+**Cross-tool comparison artifact** (naive thread pool + Rais + optional llama.cpp baseline):
 ```bash
 python3 experiments/bench_compare_tools.py --rais-tsv experiments/mlx_concurrent_results.tsv
 python3 experiments/bench_compare_tools.py --rais-tsv experiments/mlx_concurrent_results.tsv --llama-tsv experiments/llama_cpp_baseline.tsv.example

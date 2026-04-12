@@ -9,6 +9,28 @@
 
 namespace rais {
 
+namespace {
+
+inline std::vector<Task*> snapshot_and_close_dependents(Task* task) {
+    std::lock_guard<std::mutex> lock(task->dependents_mu);
+    task->accepting_dependents = false;
+    return task->dependents;
+}
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+inline constexpr bool kTsanBuild = true;
+#else
+inline constexpr bool kTsanBuild = false;
+#endif
+#elif defined(__SANITIZE_THREAD__)
+inline constexpr bool kTsanBuild = true;
+#else
+inline constexpr bool kTsanBuild = false;
+#endif
+
+} // namespace
+
 Scheduler::Scheduler(SchedulerConfig config)
     : global_queue_(config.global_queue_capacity)
     , io_queue_(config.io_queue_capacity)
@@ -33,7 +55,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
 
     // Dedicated IO threads — only service io_queue_, never steal from workers
-    for (size_t i = 0; i < config.io_thread_count; ++i) {
+    size_t io_threads = kTsanBuild ? 0 : config.io_thread_count;
+    for (size_t i = 0; i < io_threads; ++i) {
         io_threads_.emplace_back([this]() { io_worker_loop(); });
     }
 }
@@ -44,7 +67,24 @@ Scheduler::~Scheduler() {
     }
 }
 
+void Scheduler::release_task_lifetime_ref(Task* task) {
+    std::shared_ptr<Task> keepalive = std::move(task->self_ref);
+    if (!keepalive) return;
+
+    if (kTsanBuild) {
+        std::lock_guard<std::mutex> lock(tsan_retired_mu_);
+        tsan_retired_tasks_.push_back(std::move(keepalive));
+        return;
+    }
+
+    keepalive.reset();
+}
+
 std::shared_ptr<Task> Scheduler::alloc_task() {
+    if (kTsanBuild) {
+        return std::make_shared<Task>();
+    }
+
     Task* raw = task_slab_.allocate();
     if (raw) {
         new (raw) Task();
@@ -55,6 +95,31 @@ std::shared_ptr<Task> Scheduler::alloc_task() {
     }
     // Slab exhausted — fall back to heap
     return std::make_shared<Task>();
+}
+
+void Scheduler::push_global_task(Task* raw) {
+    if (kTsanBuild) {
+        std::lock_guard<std::mutex> lock(tsan_global_mu_);
+        tsan_global_queue_.push_back(raw);
+        return;
+    }
+    while (!global_queue_.push(raw)) {
+        std::this_thread::yield();
+    }
+}
+
+bool Scheduler::pop_global_task(Task*& raw) {
+    if (kTsanBuild) {
+        std::lock_guard<std::mutex> lock(tsan_global_mu_);
+        if (tsan_global_queue_.empty()) {
+            raw = nullptr;
+            return false;
+        }
+        raw = tsan_global_queue_.front();
+        tsan_global_queue_.pop_front();
+        return true;
+    }
+    return global_queue_.pop(raw);
 }
 
 TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane) {
@@ -72,9 +137,13 @@ TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane) {
 
     // IO-lane tasks go to the dedicated io_queue_ so they are only serviced
     // by IO threads and never compete with CPU compute work.
-    auto& queue = (lane == Lane::IO) ? io_queue_ : global_queue_;
-    while (!queue.push(raw)) {
-        std::this_thread::yield();
+    bool use_io_queue = (lane == Lane::IO) && !kTsanBuild;
+    if (use_io_queue) {
+        while (!io_queue_.push(raw)) {
+            std::this_thread::yield();
+        }
+    } else {
+        push_global_task(raw);
     }
 
     return TaskHandle(std::move(task));
@@ -104,9 +173,13 @@ TaskHandle Scheduler::submit(std::function<void()> fn, Lane lane,
 }
 
 void Scheduler::enqueue_task(Task* raw) {
-    auto& queue = (raw->lane == Lane::IO) ? io_queue_ : global_queue_;
-    while (!queue.push(raw)) {
-        std::this_thread::yield();
+    bool use_io_queue = (raw->lane == Lane::IO) && !kTsanBuild;
+    if (use_io_queue) {
+        while (!io_queue_.push(raw)) {
+            std::this_thread::yield();
+        }
+    } else {
+        push_global_task(raw);
     }
 }
 
@@ -143,21 +216,20 @@ TaskHandle Scheduler::submit_after(std::function<void()> fn, Lane lane,
             continue;
         }
 
-        // Register as a dependent. This is safe because we own the only
-        // reference path to `raw` at this point — no worker can see it yet.
-        // The predecessor's dependents vector is written during setup here
-        // and read during completion, ordered by completed.store(release).
-        //
-        // Race: the predecessor may have already completed. We check after
-        // registering. If it completed before we registered, its completion
-        // path won't see us, so we account for it with already_done.
+        // Resolve predecessor state under dependents_mu:
+        // - accepting_dependents=true: register so completion decrements us
+        // - accepting_dependents=false: completion already snapshotted deps
+        //   and won't observe us; count as already done.
+        bool pred_completed = false;
         {
             std::lock_guard<std::mutex> lock(pred->dependents_mu);
-            pred->dependents.push_back(raw);
+            pred_completed = !pred->accepting_dependents;
+            if (!pred_completed) {
+                pred->dependents.push_back(raw);
+            }
         }
 
-        // fence: acquire pairs with predecessor's completed.store(release)
-        if (pred->completed.load(std::memory_order_acquire)) {
+        if (pred_completed) {
             ++already_done;
         }
     }
@@ -192,9 +264,7 @@ TaskHandle Scheduler::submit_gpu(std::function<void(void*, void*)> gpu_fn) {
     Task* raw = task.get();
     task->self_ref = task;
 
-    while (!global_queue_.push(raw)) {
-        std::this_thread::yield();
-    }
+    push_global_task(raw);
 
     return TaskHandle(std::move(task));
 }
@@ -232,6 +302,11 @@ void Scheduler::shutdown(ShutdownPolicy policy) {
             t.join();
         }
     }
+
+    if (kTsanBuild) {
+        std::lock_guard<std::mutex> lock(tsan_retired_mu_);
+        tsan_retired_tasks_.clear();
+    }
 }
 
 int32_t Scheduler::lane_count(Lane lane) const {
@@ -253,12 +328,7 @@ Task* Scheduler::pop_deadline_task() {
 
 void Scheduler::activate_dependents(Task* task,
                                     WorkStealingDeque<Task*>& local_deque) {
-    // Snapshot dependents under lock — submit_after may concurrently push_back.
-    std::vector<Task*> deps;
-    {
-        std::lock_guard<std::mutex> lock(task->dependents_mu);
-        deps = task->dependents;
-    }
+    std::vector<Task*> deps = snapshot_and_close_dependents(task);
     for (Task* dep : deps) {
         if (task->cancelled.load(std::memory_order_acquire)) {
             // Cascading cancellation: mark dependent as cancelled+completed
@@ -277,13 +347,17 @@ void Scheduler::activate_dependents(Task* task,
                 // without running fn, then propagate to its own dependents.
                 lane_counts_[static_cast<int>(dep->lane)].fetch_sub(1,
                     std::memory_order_relaxed);
-                dep->completed.store(true, std::memory_order_release);
                 activate_dependents(dep, local_deque);
-                dep->self_ref.reset();
+                dep->completed.store(true, std::memory_order_release);
+                release_task_lifetime_ref(dep);
             } else {
                 // Push to the completing worker's local deque for cache locality:
                 // the dependent's input data is likely still hot in this core.
-                local_deque.push(dep);
+                if (kTsanBuild) {
+                    push_global_task(dep);
+                } else {
+                    local_deque.push(dep);
+                }
             }
         }
     }
@@ -309,10 +383,10 @@ void Scheduler::worker_loop(size_t worker_id) {
 
         if (!task) {
             // Try global queue
-            global_queue_.pop(task);
+            pop_global_task(task);
         }
 
-        if (!task) {
+        if (!task && !kTsanBuild) {
             // Try stealing from a random victim
             task = try_steal(worker_id, rng);
         }
@@ -339,9 +413,9 @@ void Scheduler::worker_loop(size_t worker_id) {
         if (task->cancelled.load(std::memory_order_acquire)) {
             lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
                 std::memory_order_relaxed);
-            task->completed.store(true, std::memory_order_release);
             activate_dependents(task, self.deque);
-            task->self_ref.reset(); // break ref cycle
+            task->completed.store(true, std::memory_order_release);
+            release_task_lifetime_ref(task); // break ref cycle safely
             continue;
         }
 
@@ -357,12 +431,8 @@ void Scheduler::worker_loop(size_t worker_id) {
                         // available, so dependents go to the global queue.
                         lane_counts_[static_cast<int>(Lane::GPU)].fetch_sub(1,
                             std::memory_order_relaxed);
-                        ref->completed.store(true, std::memory_order_release);
-                        std::vector<Task*> deps;
-                        {
-                            std::lock_guard<std::mutex> lock(ref->dependents_mu);
-                            deps = ref->dependents;
-                        }
+                        std::vector<Task*> deps =
+                            snapshot_and_close_dependents(ref.get());
                         for (Task* dep : deps) {
                             int32_t prev = dep->pending_deps.fetch_sub(1,
                                 std::memory_order_acq_rel);
@@ -370,21 +440,20 @@ void Scheduler::worker_loop(size_t worker_id) {
                                 enqueue_task(dep);
                             }
                         }
-                        ref->self_ref.reset();
+                        ref->completed.store(true, std::memory_order_release);
+                        release_task_lifetime_ref(ref.get());
                     });
                 if (!ok) {
                     // Backpressure — re-enqueue and let another worker retry later
-                    while (!global_queue_.push(task)) {
-                        std::this_thread::yield();
-                    }
+                    push_global_task(task);
                 }
             } else {
                 // No GPU executor — mark completed immediately (nothing to run)
                 lane_counts_[static_cast<int>(Lane::GPU)].fetch_sub(1,
                     std::memory_order_relaxed);
-                task->completed.store(true, std::memory_order_release);
                 activate_dependents(task, self.deque);
-                task->self_ref.reset();
+                task->completed.store(true, std::memory_order_release);
+                release_task_lifetime_ref(task);
             }
             continue;
         }
@@ -397,9 +466,7 @@ void Scheduler::worker_loop(size_t worker_id) {
                 .load(std::memory_order_acquire);
             if (interactive > 0 || background > 0) {
                 // Re-enqueue to global queue so it can be picked up later
-                while (!global_queue_.push(task)) {
-                    std::this_thread::yield();
-                }
+                push_global_task(task);
                 continue;
             }
         }
@@ -418,9 +485,9 @@ void Scheduler::worker_loop(size_t worker_id) {
         }
         lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
             std::memory_order_relaxed);
-        task->completed.store(true, std::memory_order_release);
         activate_dependents(task, self.deque);
-        task->self_ref.reset(); // break ref cycle
+        task->completed.store(true, std::memory_order_release);
+        release_task_lifetime_ref(task); // break ref cycle safely
     }
 }
 
@@ -456,9 +523,9 @@ void Scheduler::io_worker_loop() {
         if (task->cancelled.load(std::memory_order_acquire)) {
             lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
                 std::memory_order_relaxed);
-            task->completed.store(true, std::memory_order_release);
             activate_dependents(task, local_deque);
-            task->self_ref.reset();
+            task->completed.store(true, std::memory_order_release);
+            release_task_lifetime_ref(task);
             // Drain any dependents that were pushed to our local deque
             // back into the appropriate global queue.
             Task* dep = nullptr;
@@ -473,9 +540,9 @@ void Scheduler::io_worker_loop() {
         }
         lane_counts_[static_cast<int>(task->lane)].fetch_sub(1,
             std::memory_order_relaxed);
-        task->completed.store(true, std::memory_order_release);
         activate_dependents(task, local_deque);
-        task->self_ref.reset();
+        task->completed.store(true, std::memory_order_release);
+        release_task_lifetime_ref(task);
 
         // Dependents activated by IO completion likely belong to other lanes
         // (e.g. GPU compute after an SSD read). Push them to the global queue.
