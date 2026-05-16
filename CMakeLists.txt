@@ -124,6 +124,15 @@ target_compile_definitions(bench_metal PRIVATE
     RAIS_METALLIB_PATH="${METAL_LIB}")
 add_dependencies(bench_metal metal_shaders)
 
+add_executable(bench_llama_cpp_concurrent benchmarks/bench_llama_cpp_concurrent.cpp)
+target_link_libraries(bench_llama_cpp_concurrent PRIVATE rais)
+
+add_executable(bench_llama_cpp_smart_batching benchmarks/bench_llama_cpp_smart_batching.cpp)
+target_link_libraries(bench_llama_cpp_smart_batching PRIVATE rais)
+
+add_executable(bench_priority_preemption benchmarks/bench_priority_preemption.cpp)
+target_link_libraries(bench_priority_preemption PRIVATE rais)
+
 # Examples
 add_executable(priority_example examples/priority_scheduling.cpp)
 target_link_libraries(priority_example PRIVATE rais)
@@ -137,9 +146,6 @@ target_link_libraries(llama_cpp_integration_example PRIVATE rais)
 add_executable(rais_server examples/rais_server.cpp)
 target_link_libraries(rais_server PRIVATE rais)
 
-# Experiments
-add_executable(bench_inference_llm experiments/bench_inference_llm.cpp)
-target_link_libraries(bench_inference_llm PRIVATE rais)
 
 if(RAIS_BUILD_PYTHON)
     find_package(pybind11 CONFIG REQUIRED)
