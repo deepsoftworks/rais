@@ -15,19 +15,29 @@ A C++ task scheduler for AI inference on Apple Silicon. Prioritizes real-time LL
 
 ## Results
 
-**Concurrent request scheduling** (Llama-3.2-1B-Instruct-4bit, 6 clients):
+Real inference — every decode step below is an actual `mlx_lm` forward pass
+scheduled by rais, not a simulation. Benchmarked against `mlx_lm.server`'s stock
+continuous batching (**not** a naive-FIFO strawman) on Llama-3.2-3B-Instruct-4bit,
+8 GB Mac: 12 interactive requests arriving at ~3/s while 2 background streams
+saturate the model. Full harness and methodology in
+[`integrations/mlx/`](integrations/mlx/).
 
-| Metric | Naive FIFO | Rais | Speedup |
-|---|---|---|---|
-| Interactive TTFT | 4,829 ms | 1,438 ms | **3.4x** |
-| Interactive E2E | 5,653 ms | 2,254 ms | **2.5x** |
+**Interactive latency under background load** — what a scheduler exists to protect:
 
-**Layer-streaming throughput** (IO/compute overlapped):
+| System | TTFT p95 ↓ | TTFT p99 ↓ | ITL p95 ↓ | ITL p99 ↓ |
+|---|---:|---:|---:|---:|
+| **rais** (QoS lanes) | **626 ms** | **629 ms** | **68 ms** | **74 ms** |
+| `mlx_lm.server` (batched) | 764 ms | 813 ms | 115 ms | 191 ms |
+| rais, no QoS (ablation) | 1143 ms | 1431 ms | 197 ms | 253 ms |
 
-| Model | Naive | Rais | Speedup |
-|---|---|---|---|
-| SmolLM2-135M (257 MB) | 157 tok/s | 188 tok/s | **1.20x** |
-| TinyLlama-1.1B (2.1 GB) | 15.5 tok/s | 17.8 tok/s | **1.15x** |
+Strict lane priority gives interactive requests the lowest tail latency of the
+three — ITL p95 **1.7×** and p99 **2.6×** below `mlx_lm.server`'s fair-share
+batching. The honest tradeoff: rais spends the GPU on interactive work first, so
+background throughput drops to ~11% of its isolated rate (floored by
+anti-starvation, never fully starved), whereas the server's batching keeps
+background near full speed and higher *aggregate* throughput. Different policies —
+rais protects latency; batching maximizes throughput. See
+[`integrations/mlx/README.md`](integrations/mlx/README.md) for the full breakdown.
 
 ## Quick start
 
@@ -71,11 +81,24 @@ Key internals: lock-free MPMC ring + Chase-Lev work-stealing deques, earliest-de
 
 ## Integration
 
-Works with MLX/mlx-lm, llama.cpp, and PyTorch. See `examples/` for integration patterns:
+**Real, runnable:** [`integrations/mlx/`](integrations/mlx/) drives live `mlx_lm`
+inference through the scheduler with per-request QoS lanes — this is the
+integration the Results above measure. Build the Python module with
+`WITH_PYTHON=1 ./install.sh`, then:
+
+```bash
+python3 integrations/mlx/fetch_model.py
+python3 integrations/mlx/rais_mlx.py --prompt "Explain unified memory" --max-tokens 48
+python3 integrations/mlx/bench_concurrency.py --server   # reproduce the Results table
+```
+
+The C++ files under `examples/` are usage sketches, not wired engines:
 
 - `examples/minimal_submit.cpp` -- basic scheduler usage
-- `examples/llama_cpp_integration.cpp` -- llama.cpp integration
-- `examples/rais_server.cpp` -- server mode
+- `examples/priority_scheduling.cpp` -- QoS lanes
+- `examples/llama_cpp_integration.cpp` / `examples/rais_server.cpp` -- illustrative
+  handoff shapes with simulated decode (llama.cpp and a PyTorch path are roadmap,
+  not yet real integrations)
 
 ## Building
 
