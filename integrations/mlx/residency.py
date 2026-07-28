@@ -22,6 +22,7 @@ block i+1 with the compute of block i via rais's IO lane is the next step.
 from __future__ import annotations
 
 import glob
+import threading
 from typing import Dict, List, Optional
 
 import mlx.core as mx
@@ -86,6 +87,11 @@ def _make_streamed_class(base: type) -> type:
             mgr = self.__dict__["_rmgr"]
             idx = self.__dict__["_ridx"]
             mgr.ensure_resident(idx)
+            # Kick off this block's successor on rais's IO lane so its weights
+            # stream in from SSD while this block computes on the GPU. The IO
+            # thread makes progress whenever this block's mx.eval releases the
+            # GIL. No-op unless a scheduler was provided.
+            mgr.maybe_prefetch(mgr.next_streamed(idx))
             out = base.__call__(self, *args, **kwargs)
             mgr.after_block(idx)
             # Force materialization of this block's output so the streamed
@@ -110,6 +116,11 @@ class ResidencyManager:
         budget_gb: soft budget for *block* weights; pins as many whole blocks as fit.
         pinned_blocks: explicit number of blocks to keep always-resident (overrides
             budget_gb). The rest are streamed.
+        scheduler: optional rais.Scheduler; when given with ``prefetch=True``, the
+            next streamed block's weights are loaded on ``io_lane`` concurrently
+            with the current block's compute.
+        io_lane: the rais lane value to submit prefetch reads on (e.g. rais.Lane.IO).
+        prefetch: enable IO-lane prefetch overlap.
     """
 
     def __init__(
@@ -118,8 +129,20 @@ class ResidencyManager:
         repo_or_path: str,
         budget_gb: Optional[float] = None,
         pinned_blocks: Optional[int] = None,
+        scheduler=None,
+        io_lane=None,
+        prefetch: bool = False,
     ):
         self._model = model
+        self._scheduler = scheduler
+        self._io_lane = io_lane
+        self._prefetch = bool(prefetch and scheduler is not None and io_lane is not None)
+        self._lock = threading.Lock()
+        self._prefetch_handles: Dict[int, object] = {}
+        # Behaviour counters (streamed blocks only): a "hit" means the IO-lane
+        # prefetch finished before the block was needed (full overlap); "late"
+        # means it was still in flight and we waited; "sync" means no prefetch.
+        self.stats = {"prefetch_hit": 0, "prefetch_late": 0, "sync_reload": 0}
         self._blocks: List[nn.Module] = list(model.model.layers)
         self.n = len(self._blocks)
         # Reload source: shard file paths, indexed per block. We re-open the
@@ -174,9 +197,17 @@ class ResidencyManager:
             [(k, mx.zeros(1)) for k, _ in tree_flatten(inner.parameters())]
         )
         inner.update(placeholder)
-        self._resident.discard(idx)
+        with self._lock:
+            self._resident.discard(idx)
 
-    def _reload(self, idx: int) -> None:
+    def _do_reload(self, idx: int, materialize: bool) -> None:
+        """Reload block ``idx`` from its shard(s). Safe to call off the main thread.
+
+        ``materialize=True`` (prefetch path) forces the weight reads to happen now,
+        on the calling (IO) thread, so they overlap with GPU compute elsewhere.
+        ``materialize=False`` (synchronous path) leaves the arrays lazy for the
+        upcoming forward to evaluate.
+        """
         inner = self._blocks[idx]
         prefix = f"model.layers.{idx}."
         sub = []
@@ -188,12 +219,51 @@ class ResidencyManager:
             # `sub` holds refs to this block's arrays; the rest of `d` is dropped.
             del d
         inner.update(tree_unflatten(sub))
-        self._resident.add(idx)
+        if materialize:
+            leaves = [v for _, v in tree_flatten(inner.parameters())]
+            mx.eval(leaves)  # force the SSD/page-cache read now
+            del leaves
+        with self._lock:
+            self._resident.add(idx)
 
-    # --- hooks called by _StreamedBlock --------------------------------------
+    # --- hooks called by the streamed block ----------------------------------
     def ensure_resident(self, idx: int) -> None:
-        if idx not in self._resident:
-            self._reload(idx)
+        with self._lock:
+            handle = self._prefetch_handles.pop(idx, None)
+            resident = idx in self._resident
+        if resident:
+            if handle is not None:
+                self.stats["prefetch_hit"] += 1  # prefetch beat the block
+            return
+        if handle is not None:
+            handle.wait()  # let the IO-lane prefetch finish (marks resident)
+            with self._lock:
+                resident = idx in self._resident
+            if resident:
+                self.stats["prefetch_late"] += 1  # overlapped, but not fully
+                return
+            # Prefetch failed (unraisable error swallowed on the IO thread) —
+            # fall back to a synchronous reload so we never compute on placeholders.
+        if idx not in self._pinned_set:
+            self.stats["sync_reload"] += 1
+        self._do_reload(idx, materialize=False)
+
+    def next_streamed(self, idx: int) -> Optional[int]:
+        nxt = idx + 1
+        if nxt < self.n and nxt not in self._pinned_set:
+            return nxt
+        return None
+
+    def maybe_prefetch(self, idx: Optional[int]) -> None:
+        if not self._prefetch or idx is None:
+            return
+        with self._lock:
+            if (idx in self._resident or idx in self._prefetch_handles
+                    or idx in self._pinned_set):
+                return
+            handle = self._scheduler.submit(
+                lambda i=idx: self._do_reload(i, materialize=True), self._io_lane)
+            self._prefetch_handles[idx] = handle
 
     def after_block(self, idx: int) -> None:
         if idx not in self._pinned_set:

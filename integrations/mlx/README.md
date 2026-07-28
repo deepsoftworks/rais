@@ -132,9 +132,29 @@ python3 integrations/mlx/bench_oversub.py                 # the curve above + pl
 python3 integrations/mlx/bench_oversub.py --model <big> --oom-demo  # stock OOM vs runs
 ```
 
-This first cut is synchronous. The next step is overlapping block *i+1*'s reload
-with block *i*'s compute on rais's IO lane (the `LayerStreamer` shape) — where the
-scheduler earns its keep over the OS demand-pager.
+### IO-lane prefetch
+
+`ResidencyManager(..., scheduler=rais.Scheduler(...), io_lane=rais.Lane.IO,
+prefetch=True)` streams the *next* block's weights on rais's IO lane while the
+current block computes on the GPU: the IO thread runs the reload whenever the
+current block's `mx.eval` releases the GIL, and the block's own hook waits on the
+prefetch only if it hasn't finished. No C++ bindings change was needed — the
+existing `submit(fn, Lane.IO)` + `TaskHandle.wait()` cover it (rais's C++
+`LayerStreamer`/buffer pool manages *rais-owned* Metal buffers, which don't map
+onto MLX-owned weight arrays, so the Python IO lane is the right seam here).
+
+```bash
+python3 integrations/mlx/bench_oversub.py --compare-prefetch --pin 4
+```
+
+Measured (3B-4bit, warm cache): **100% of streamed block loads are serviced
+through the IO lane concurrently with compute**, output bit-exact. But on a warm
+page cache the reads are RAM hits, so prefetch hides no latency and only adds one
+block of peak memory (~+0.45 GB) — throughput is a wash. **The win is the cold /
+over-RAM regime**, where reads actually touch SSD; reproduce with a model larger
+than free RAM (via `--oom-demo`) or `sudo purge` between runs. On this 8 GB box
+the 3B stays fully page-cached, so the wall-time benefit isn't demonstrable here —
+only that the overlap mechanism is real and correctly scheduled by rais.
 
 ## Scope
 

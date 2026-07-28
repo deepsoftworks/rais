@@ -113,6 +113,65 @@ def run_curve(model_path: str, pins: List[int], max_tokens: int) -> List[Point]:
     return points
 
 
+def _import_rais():
+    try:
+        import rais  # type: ignore
+        return rais
+    except ImportError:
+        build = os.path.abspath(os.path.join(HERE, "..", "..", "build"))
+        if os.path.isdir(build):
+            sys.path.insert(0, build)
+        import rais  # type: ignore
+        return rais
+
+
+def run_prefetch_compare(model_path: str, pin: int, max_tokens: int,
+                         io_threads: int) -> None:
+    """A/B: synchronous reload vs rais IO-lane prefetch at one residency budget."""
+    rais = _import_rais()
+    sampler = _sampler()
+
+    print("reference (full-resident) ...", file=sys.stderr, flush=True)
+    model, tok = _load(model_path)
+    ref, _, _ = _generate(model, tok, sampler, max_tokens)
+    del model
+    mx.clear_cache()
+
+    def one(prefetch: bool):
+        model, tok = _load(model_path)
+        sched = None
+        kw = {}
+        if prefetch:
+            sched = rais.Scheduler(num_workers=1, io_thread_count=io_threads)
+            kw = dict(scheduler=sched, io_lane=rais.Lane.IO, prefetch=True)
+        mgr = ResidencyManager(model, model_path, pinned_blocks=pin, **kw)
+        toks, peak, tps = _generate(model, tok, sampler, max_tokens)
+        st = dict(mgr.stats)
+        if sched is not None:
+            sched.shutdown()
+        del model, mgr
+        mx.clear_cache()
+        return toks, peak, tps, st
+
+    print(f"\n[compare] pin {pin}, {max_tokens} tokens", file=sys.stderr)
+    for label, pf in (("synchronous  ", False), ("io-prefetch  ", True)):
+        toks, peak, tps, st = one(pf)
+        extra = ""
+        if pf:
+            serviced = st["prefetch_hit"] + st["prefetch_late"]
+            total = serviced + st["sync_reload"]
+            pct = 100.0 * serviced / max(total, 1)
+            extra = (f"  | prefetch overlapped {pct:.0f}% of streamed loads "
+                     f"(hit={st['prefetch_hit']} late={st['prefetch_late']} "
+                     f"sync={st['sync_reload']})")
+        print(f"  {label} peak {peak:.2f} GB  {tps:5.1f} tok/s  "
+              f"ok={toks == ref}{extra}", file=sys.stderr)
+    print("\nNote: on a warm page cache the streamed weights are RAM-resident, so "
+          "prefetch\nhides no SSD latency and only adds overhead. Its win is the "
+          "cold / over-RAM\nregime — reproduce with a model larger than free RAM, "
+          "or `sudo purge` between runs.", file=sys.stderr)
+
+
 def run_oom_demo(model_path: str, budget_gb: float, max_tokens: int) -> None:
     """Stock (all-resident) vs residency-bounded on a possibly-over-RAM model."""
     sampler = _sampler()
@@ -180,11 +239,19 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--oom-demo", action="store_true")
     ap.add_argument("--oom-budget-gb", type=float, default=3.0)
+    ap.add_argument("--compare-prefetch", action="store_true",
+                    help="A/B synchronous reload vs rais IO-lane prefetch")
+    ap.add_argument("--pin", type=int, default=4, help="pinned blocks for --compare-prefetch")
+    ap.add_argument("--io-threads", type=int, default=2)
     ap.add_argument("--out", default=os.path.join(HERE, "oversub_results.tsv"))
     args = ap.parse_args()
 
     if args.oom_demo:
         run_oom_demo(args.model, args.oom_budget_gb, args.max_tokens)
+        return 0
+
+    if args.compare_prefetch:
+        run_prefetch_compare(args.model, args.pin, args.max_tokens, args.io_threads)
         return 0
 
     pins = [int(x) for x in args.pins.split(",") if x != ""]
