@@ -31,13 +31,13 @@ compile_commands.json
 # Profiler trace output
 rais_trace.bin
 
-# Experiments — model weights and HuggingFace cache
-experiments/models/
-experiments/.hf_cache/
+# Integration benchmarks — model weights and local HuggingFace cache
+integrations/mlx/models/
+integrations/mlx/.hf_cache/
 
-# Experiments — generated results and plots (reproducible from scripts)
-experiments/*.tsv
-experiments/*.png
+# Integration benchmarks — generated results and plots (reproducible from scripts)
+integrations/mlx/*.tsv
+integrations/mlx/*.png
 
 # Python
 __pycache__/

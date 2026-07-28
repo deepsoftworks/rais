@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,6 +18,12 @@ enum class Lane : uint8_t {
     IO          = 4, // dedicated IO threads for SSD reads, never competes with CPU/GPU
 };
 
+// Anti-starvation knobs. Workers pop lane queues in strict priority order,
+// so sustained Interactive load would otherwise starve lower lanes:
+// - kBackgroundPromotionNs: at most this often, each worker offers the
+//   Background/Bulk queues one pop ahead of the Interactive queue.
+// - kBulkPromotionNs: a Bulk task older than this is promoted to Background
+//   and runs even while Interactive/Background work is still in flight.
 inline constexpr uint64_t kBackgroundPromotionNs = 100'000'000ULL; // 100ms
 inline constexpr uint64_t kBulkPromotionNs       = 500'000'000ULL; // 500ms
 
@@ -62,11 +69,21 @@ public:
     TaskHandle() = default;
     explicit TaskHandle(std::shared_ptr<Task> t) : task_(std::move(t)) {}
 
-    /// Spin-wait with progressive backoff until the task completes.
+    /// Block until the task completes. Spins briefly for low latency on
+    /// short tasks, then falls back to progressively longer sleeps (capped
+    /// at 100us) so waiting on a long task doesn't burn a core.
     void wait() const {
         if (!task_) return;
+        uint32_t spins = 0;
+        uint32_t backoff_us = 1;
         while (!task_->completed.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+            if (spins < 64) {
+                ++spins;
+                std::this_thread::yield();
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+            if (backoff_us < 100) backoff_us *= 2;
         }
     }
 

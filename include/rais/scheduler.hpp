@@ -24,7 +24,9 @@ enum class ShutdownPolicy { Drain, Cancel };
 
 struct SchedulerConfig {
     size_t num_workers          = 0; // 0 = hardware_concurrency() - 1
-    size_t global_queue_capacity = 65536; // must be power of two
+    // Capacity of each per-lane CPU queue (Interactive, Background, Bulk).
+    // Must be a power of two.
+    size_t global_queue_capacity = 65536;
     MetalExecutor* gpu_executor = nullptr; // optional — enables Lane::GPU dispatch
 
     // Number of dedicated IO threads. These threads only service Lane::IO
@@ -82,6 +84,11 @@ private:
         std::thread thread;
         WorkStealingDeque<Task*> deque;
         size_t id = 0;
+        // Anti-starvation state (see pop_cpu_task): pop_count amortizes the
+        // clock read; last_low_service_ns is the last time this worker
+        // offered the Background/Bulk queues a pop ahead of Interactive.
+        uint64_t pop_count = 0;
+        uint64_t last_low_service_ns = 0;
 
         Worker() = default;
         Worker(const Worker&) = delete;
@@ -90,19 +97,31 @@ private:
 
     void worker_loop(size_t worker_id);
     Task* try_steal(size_t worker_id, std::mt19937& rng);
-    void check_starvation_promotions(Task* task);
     std::shared_ptr<Task> alloc_task();
     Task* pop_deadline_task();
-    void activate_dependents(Task* task, WorkStealingDeque<Task*>& local_deque);
+    // local_deque may be null (IO threads, Metal completion threads) — newly
+    // runnable dependents are then routed to their lane queues instead.
+    void activate_dependents(Task* task, WorkStealingDeque<Task*>* local_deque);
+    // Mark a task complete (its fn, if any, has already run or was skipped),
+    // wake dependents, and drop the scheduler's lifetime reference.
+    void finish_task(Task* task, WorkStealingDeque<Task*>* local_deque);
     void enqueue_task(Task* raw);
-    void push_global_task(Task* raw);
-    bool pop_global_task(Task*& raw);
+    Task* pop_cpu_task(Worker& self);
     void io_worker_loop();
     void release_task_lifetime_ref(Task* task);
 
+    std::atomic<int32_t>& lane_counter(Lane lane) {
+        return lane_counts_[static_cast<int>(lane)].value;
+    }
+
     static constexpr size_t kTaskSlabCapacity = 8192;
 
-    MPMCQueue<Task*> global_queue_;
+    // Per-lane CPU queues, popped in strict priority order (Interactive
+    // first). GPU dispatch requests ride the Interactive queue: handing a
+    // command buffer to the MetalExecutor is cheap and latency-sensitive.
+    MPMCQueue<Task*> interactive_queue_;
+    MPMCQueue<Task*> background_queue_;
+    MPMCQueue<Task*> bulk_queue_;
     MPMCQueue<Task*> io_queue_;         // separate queue for Lane::IO tasks
     std::vector<std::unique_ptr<Worker>> workers_;
     std::vector<std::thread> io_threads_; // dedicated IO threads
@@ -120,7 +139,12 @@ private:
 
     // Per-lane admission counters. Indexed by static_cast<int>(Lane).
     // 5 slots: Interactive(0), Background(1), Bulk(2), GPU(3), IO(4).
-    alignas(64) std::atomic<int32_t> lane_counts_[5] = {};
+    // Each counter gets its own cache line: every submit and completion hits
+    // one of these, and adjacent lanes are touched by different threads.
+    struct alignas(64) LaneCounter {
+        std::atomic<int32_t> value{0};
+    };
+    LaneCounter lane_counts_[5];
 
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> shutdown_called_{false};
