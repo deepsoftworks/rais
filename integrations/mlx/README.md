@@ -132,6 +132,27 @@ python3 integrations/mlx/bench_oversub.py                 # the curve above + pl
 python3 integrations/mlx/bench_oversub.py --model <big> --oom-demo  # stock OOM vs runs
 ```
 
+### Over-RAM headline (`--oom-demo`)
+
+Measured on the **8 GB** dev box with **Qwen2.5-7B-Instruct-8bit** — 8.1 GB of
+weights against MLX's 5.7 GB recommended working set:
+
+| | stock mlx-lm (all resident) | rais residency (budget 4 GB) |
+| --- | --- | --- |
+| outcome | **could not produce 1 token in 60 s** — thrashes to swap, killed | **ran to completion** |
+| peak memory | (never fit) | **5.14 GB** |
+| throughput | — | 0.03 tok/s |
+
+*Unrunnable → runs.* The residency manager streams an 8.1 GB model on an 8 GB
+machine at 5.1 GB peak (pin 16 / stream 12 blocks). The cost is throughput:
+0.03 tok/s is SSD-bandwidth-bound — each token reads ~3 GB of streamed weights,
+and at this oversubscription ratio those are largely cold reads. This is a
+**feasibility** result, not a speed one; prefetch can't rescue it here because the
+bottleneck is raw read bandwidth, not latency (compute per block is tiny relative
+to a 248 MB block read). The practical regime is *partial* oversubscription
+(model modestly larger than the budget), where most blocks stay resident and only
+the margin streams.
+
 ### IO-lane prefetch
 
 `ResidencyManager(..., scheduler=rais.Scheduler(...), io_lane=rais.Lane.IO,

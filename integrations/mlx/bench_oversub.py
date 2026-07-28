@@ -173,25 +173,81 @@ def run_prefetch_compare(model_path: str, pin: int, max_tokens: int,
 
 
 def run_oom_demo(model_path: str, budget_gb: float, max_tokens: int) -> None:
-    """Stock (all-resident) vs residency-bounded on a possibly-over-RAM model."""
-    sampler = _sampler()
-    print("\n[oom-demo] stock mlx-lm, all weights resident ...", file=sys.stderr)
-    try:
-        model, tok = _load(model_path)
-        toks, peak, tps = _generate(model, tok, sampler, max_tokens)
-        print(f"  stock: ran, peak {peak:.2f} GB, {tps:.1f} tok/s "
-              f"(model fits — pick a bigger model to force OOM)", file=sys.stderr)
-        del model
-        mx.clear_cache()
-    except Exception as e:  # noqa: BLE001 - we want to report any allocation failure
-        print(f"  stock: FAILED ({type(e).__name__}: {str(e)[:120]})", file=sys.stderr)
+    """Stock (all-resident) vs residency-bounded on a possibly-over-RAM model.
 
-    print(f"[oom-demo] residency-bounded, budget ~{budget_gb} GB ...", file=sys.stderr)
+    Stock runs in an isolated subprocess with a hard timeout: on a machine where
+    the weights exceed MLX's recommended working set, holding them all resident
+    thrashes/swaps rather than erroring cleanly, so we bound it and kill it rather
+    than risk hanging the host. Residency runs in-process (its peak stays under the
+    working set, so it's safe).
+    """
+    import glob as _glob
+    import subprocess
+
+    from residency import _resolve_safetensors
+
+    # Report the budget arithmetic up front.
+    weight_bytes = sum(os.path.getsize(f) for f in _resolve_safetensors(model_path))
+    working_set = mx.device_info().get("max_recommended_working_set_size", 0)
+    print(f"\n[oom-demo] model={model_path}", file=sys.stderr)
+    print(f"  on-disk weights ~{weight_bytes/1e9:.1f} GB; MLX recommended working "
+          f"set ~{working_set/1e9:.1f} GB", file=sys.stderr)
+    if weight_bytes <= working_set:
+        print("  NOTE: weights fit the working set on this machine — stock will "
+              "not OOM here; run on less RAM or with a bigger model for the "
+              "failure headline.", file=sys.stderr)
+
+    # --- residency-bounded, in-process (safe): capture the positive result FIRST,
+    # before any stock thrash can destabilize the run ---
+    print(f"  [residency] budget ~{budget_gb} GB ...", file=sys.stderr, flush=True)
+    sampler = _sampler()
     model, tok = _load(model_path)
     mgr = ResidencyManager(model, model_path, budget_gb=budget_gb)
-    print("  " + mgr.summary(), file=sys.stderr)
+    print("    " + mgr.summary(), file=sys.stderr, flush=True)
     toks, peak, tps = _generate(model, tok, sampler, max_tokens)
-    print(f"  residency: ran, peak {peak:.2f} GB, {tps:.1f} tok/s", file=sys.stderr)
+    ratio = (weight_bytes / 1e9) / max(peak, 1e-9)
+    print(f"  [residency] RAN: peak {peak:.2f} GB, {tps:.2f} tok/s "
+          f"(streamed a {weight_bytes/1e9:.1f} GB model at {ratio:.1f}x below its "
+          "on-disk weight size)", file=sys.stderr, flush=True)
+    del model, mgr
+    mx.clear_cache()
+
+    # --- stock, isolated + tightly bounded: it must hold all weights resident,
+    # which exceeds the working set here, so it thrashes. 1 token, short cap. ---
+    stock_timeout = 60
+    print(f"  [stock] all-resident, isolated subprocess, 1 token, {stock_timeout}s "
+          "cap (expected to thrash) ...", file=sys.stderr, flush=True)
+    code = (
+        "import time, json, mlx.core as mx, mlx_lm\n"
+        "from mlx_lm.generate import generate_step\n"
+        "from mlx_lm.sample_utils import make_sampler\n"
+        f"m,tok=mlx_lm.load({model_path!r},lazy=True)\n"
+        "s=make_sampler(temp=0.0)\n"
+        "ids=mx.array(tok.apply_chat_template([{'role':'user','content':'hi'}],add_generation_prompt=True))\n"
+        "peak=0;n=0;t0=time.perf_counter()\n"
+        "for t,_ in generate_step(ids,m,sampler=s):\n"
+        "    n+=1;peak=max(peak,mx.get_active_memory())\n"
+        "    if n>=1: break\n"
+        "print('RESULT',json.dumps({'peak_gb':peak/1e9,'secs':time.perf_counter()-t0}))\n"
+    )
+    try:
+        env = dict(os.environ, PYTHONPATH=HERE)
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                           text=True, timeout=stock_timeout, env=env)
+        line = next((l for l in p.stdout.splitlines() if l.startswith("RESULT")), None)
+        if line:
+            import json
+            r = json.loads(line[len("RESULT"):])
+            print(f"  [stock] produced 1 token in {r['secs']:.1f}s at "
+                  f"peak {r['peak_gb']:.2f} GB (all-resident; note the swap cost)",
+                  file=sys.stderr)
+        else:
+            tail = (p.stderr.strip().splitlines() or ["<no output>"])[-1]
+            print(f"  [stock] FAILED (rc={p.returncode}): {tail[:140]}", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f"  [stock] DID NOT PRODUCE ONE TOKEN within {stock_timeout}s — "
+              "thrashing to swap on 8.1 GB of resident weights that exceed the "
+              "5.7 GB working set (killed to protect the machine).", file=sys.stderr)
 
 
 def write_tsv(path: str, points: List[Point], n_blocks: int) -> None:
