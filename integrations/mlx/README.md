@@ -94,8 +94,52 @@ excellent and rais does not beat it there. rais's edge is explicit priority when
 interactive latency must be protected — and, beyond this benchmark, the
 memory-oversubscription regime where the model doesn't fit at all.
 
+## Oversubscription — bounded-memory streaming (`residency.py`)
+
+The other half of the story: running a model at **bounded peak memory** by owning
+weight *residency*. MLX materializes a model's whole weight set into resident
+memory on first use and keeps it there, so a model larger than the memory budget
+can't run under stock mlx-lm. `ResidencyManager` pins as many transformer blocks
+as fit in a budget and **streams the rest** — evicting a streamed block's weights
+after it computes and re-materializing them from the mmap'd safetensors before the
+block is needed again.
+
+Three mechanics make this work (see `../../oversubscription.md`):
+re-classing block instances so model introspection keeps working; forcing a
+per-block eval so MLX's lazy graph doesn't keep every block's weights alive until
+end-of-token; and reloading from **fresh** lazy arrays each time (a persistent
+weight dict would pin everything resident once materialized).
+
+**Graceful degradation** (Llama-3.2-3B-4bit; `bench_oversub.py`, steady-state
+decode peak, bit-exact output at every point):
+
+| resident blocks | peak active memory | throughput |
+| ---: | ---: | ---: |
+| 28 / 28 (full, stock-equivalent) | 4.20 GB | 15.1 tok/s |
+| 14 / 28 | 2.39 GB | 7.7 tok/s |
+| 8 / 28 | 1.37 GB | 4.5 tok/s |
+| 4 / 28 | 0.70 GB | 5.4 tok/s |
+| 0 / 28 (stream all) | 0.25 GB | 5.0 tok/s |
+
+Peak memory is controllable across a **16.7×** span by choosing how many blocks
+stay resident, with identical output throughout. The win is **feasibility, not
+speed**: streaming trades throughput (and, at heavy oversubscription, SSD
+bandwidth) for the ability to run a model that otherwise wouldn't fit.
+
+```bash
+python3 integrations/mlx/residency.py --pinned 4          # bounded-memory smoke test
+python3 integrations/mlx/bench_oversub.py                 # the curve above + plot
+python3 integrations/mlx/bench_oversub.py --model <big> --oom-demo  # stock OOM vs runs
+```
+
+This first cut is synchronous. The next step is overlapping block *i+1*'s reload
+with block *i*'s compute on rais's IO lane (the `LayerStreamer` shape) — where the
+scheduler earns its keep over the OS demand-pager.
+
 ## Scope
 
-This proves **concurrent scheduling + QoS separation** on models that fit in RAM.
-It does *not* attempt memory oversubscription / layer streaming for models larger
-than physical RAM — that is the separate, larger wedge tracked in `positioning.md`.
+The concurrency section proves **concurrent scheduling + QoS separation** on
+fits-in-RAM models; this section proves **bounded-memory oversubscription**. A
+real over-RAM headline (a model bigger than usable RAM that stock mlx-lm can't
+load) needs a machine with the model on disk — run `--oom-demo` with a 7B-8bit /
+14B-4bit to produce it.
