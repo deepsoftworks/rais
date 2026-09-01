@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/deepsoftworks/rais/actions/workflows/ci.yml"><img src="https://github.com/deepsoftworks/rais/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://codeberg.org/deepsoftworks/rais/releases"><img src="https://img.shields.io/gitea/v/release/deepsoftworks/rais?gitea_url=https%3A%2F%2Fcodeberg.org&label=latest%20version" alt="Latest Version"></a>
+  <a href="https://github.com/deepsoftworks/rais/releases"><img src="https://img.shields.io/github/v/release/deepsoftworks/rais?label=latest%20version" alt="Latest Version"></a>
   <img alt="macOS" src="https://img.shields.io/badge/-macOS-black?style=flat-square&logo=apple&logoColor=white" />
 </p>
 
@@ -42,7 +42,7 @@ rais protects latency; batching maximizes throughput. See
 ## Quick start
 
 ```bash
-git clone https://codeberg.org/deepsoftworks/rais.git && cd rais
+git clone https://github.com/deepsoftworks/rais.git && cd rais
 ./install.sh
 cmake --build build --target priority_example
 ./build/priority_example
